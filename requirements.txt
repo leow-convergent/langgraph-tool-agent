@@ -2,3 +2,7 @@ langgraph>=0.2
 langchain-core>=0.3
 langchain-openai>=0.2
 python-dotenv>=1.0
+convergent-sdk>=0.0.10
+opentelemetry-instrumentation-openai-v2==2.4b0
+# 2.4b0 imports opentelemetry.util.genai.instruments, which 1.2b0 removed
+opentelemetry-util-genai<1.2

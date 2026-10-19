@@ -15,6 +15,7 @@ import os
 import sys
 from datetime import datetime
 
+import convergent
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -71,12 +72,18 @@ TOOLS = {"calculator": calculator, "current_time": current_time, "mock_weather":
 
 # ---------- 2. 带兜底的工具执行节点：failure -> retry(1) -> fallback ----------
 
-def run_tool_with_fallback(name: str, args: dict) -> str:
+def run_tool_with_fallback(name: str, args: dict, call_id: str = "") -> str:
     """执行一个工具；失败后重试 1 次；仍失败则返回兜底文案而不是抛异常，
     保证 agent 图不中断 —— 这是本仓库要演示的核心行为。"""
     for attempt in (1, 2):
         try:
-            return TOOLS[name](**args)
+            # Convergent：每次尝试一个 tool span，失败的尝试记为 error
+            with convergent.span(name=name, operation="tool_call",
+                                 attributes={"gen_ai.tool.call.id": call_id, "tool.attempt": attempt}) as span:
+                span.set_input(args)
+                result = TOOLS[name](**args)
+                span.set_output(result)
+                return result
         except Exception as exc:  # noqa: BLE001 — 演示用：任何工具异常都走同一处理路径
             print(f"    [tool {name}] attempt {attempt} failed: {exc}")
     return f"({name} is currently unavailable; please try again later.)"
@@ -87,7 +94,7 @@ def call_tools(state: MessagesState):
     out = []
     for tc in last.tool_calls:
         print(f"    -> tool call: {tc['name']} {tc['args']}")
-        result = run_tool_with_fallback(tc["name"], tc["args"] or {})
+        result = run_tool_with_fallback(tc["name"], tc["args"] or {}, tc["id"])
         out.append(ToolMessage(content=result, tool_call_id=tc["id"]))
     return {"messages": out}
 
@@ -124,9 +131,19 @@ if __name__ == "__main__":
     # Windows 控制台默认 GBK：模型输出可能包含 emoji 等字符，强制 UTF-8 输出避免崩编码
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # Convergent 追踪：release 取自 CONVERGENT_RELEASE；openai 埋点默认不记录消息内容，这里显式开启
+    os.environ.setdefault("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "span_only")
+    os.environ.setdefault("OTEL_SEMCONV_STABILITY_OPT_IN", "gen_ai_latest_experimental")
+    from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
+
+    convergent.init()
+    OpenAIInstrumentor().instrument()
     for q in DEMOS:
         print(f"\n=== USER: {q}")
-        result = app.invoke({"messages": [("user", q)]})
+        with convergent.span(name="langgraph-tool-agent", operation="agent_run", model=MODEL) as run:
+            run.set_input(q)
+            result = app.invoke({"messages": [("user", q)]})
+            run.set_output(result["messages"][-1].content)
         for m in result["messages"]:
             tag = type(m).__name__
             text = getattr(m, "content", "") or (f"tool_calls={getattr(m, 'tool_calls', None)}")
